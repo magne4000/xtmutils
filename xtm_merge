@@ -1,0 +1,352 @@
+﻿#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+from struct import unpack_from
+import re
+import os
+import hashlib
+import copy
+import sys
+
+# 0 - Quiet
+# 1 - Print info
+# 2 - Print debug
+DEBUG = 1
+READ_BLOCK_SIZE = 65536
+
+def debug(_str, level = 1, erase = False):
+    global DEBUG
+    if DEBUG >= level:
+        _str = str(_str)
+        if erase:
+            sys.stdout.write("\r" + _str)
+        else:
+            sys.stdout.write("\n" + _str + "\n")
+        sys.stdout.flush()
+
+def getTerminalSize():
+    """
+    returns (lines:int, cols:int)
+    """
+    def ioctl_GWINSZ(fd):
+        import fcntl, termios, struct
+        return struct.unpack("hh", fcntl.ioctl(fd, termios.TIOCGWINSZ, "1234"))
+    # try stdin, stdout, stderr
+    for fd in (0, 1, 2):
+        try:
+            return ioctl_GWINSZ(fd)
+        except:
+            pass
+    # try os.ctermid()
+    try:
+        fd = os.open(os.ctermid(), os.O_RDONLY)
+        try:
+            return ioctl_GWINSZ(fd)
+        finally:
+            os.close(fd)
+    except:
+        pass
+    # try `stty size`
+    try:
+        return tuple(int(x) for x in os.popen("stty size", "r").read().split())
+    except:
+        pass
+    # try environment variables
+    try:
+        return tuple(int(os.getenv(var)) for var in ("LINES", "COLUMNS"))
+    except:
+        pass
+    # i give up. return default.
+    return (25, 80)
+ 
+class ProgressBar:
+    
+    instance = None
+    
+    def __init__(self, min_value = 0, max_value = 100, **kwargs):
+        self.char = kwargs.get('char', '#')
+        self.mode = kwargs.get('mode', 'dynamic') # fixed or dynamic
+        if not self.mode in ['fixed', 'dynamic']:
+            self.mode = 'fixed'
+ 
+        self.bar = ''
+        self.min = min_value
+        self.max = max_value
+        self.span = max_value - min_value
+        self.amount = 0       # When amount == max, we are 100% done 
+        self.update_amount(0)
+        ProgressBar.instance = self
+ 
+ 
+    def increment_amount(self, add_amount = 1):
+        """
+        Increment self.amount by 'add_ammount' or default to incrementing
+        by 1, and then rebuild the bar string. 
+        """
+        new_amount = self.amount + add_amount
+        if new_amount < self.min: new_amount = self.min
+        if new_amount > self.max: new_amount = self.max
+        self.amount = new_amount
+        self.build_bar()
+ 
+ 
+    def update_amount(self, new_amount = None):
+        """
+        Update self.amount with 'new_amount', and then rebuild the bar 
+        string.
+        """
+        if not new_amount: new_amount = self.amount
+        if new_amount < self.min: new_amount = self.min
+        if new_amount > self.max: new_amount = self.max
+        self.amount = new_amount
+        self.build_bar()
+ 
+ 
+    def build_bar(self):
+        """
+        Figure new percent complete, and rebuild the bar string base on 
+        self.amount.
+        """
+        diff = float(self.amount - self.min)
+        percent_done = (diff / float(self.span)) * 100.0
+ 
+        # figure the proper number of 'character' make up the bar 
+        lines, cols = getTerminalSize()
+        all_full = cols - 13
+        num_hashes = int(round((percent_done * all_full) / 100))
+ 
+        if self.mode == 'dynamic':
+            # build a progress bar with self.char (to create a dynamic bar
+            # where the percent string moves along with the bar progress.
+            self.bar = self.char * num_hashes
+        else:
+            # build a progress bar with self.char and spaces (to create a 
+            # fixe bar (the percent string doesn't move)
+            self.bar = self.char * num_hashes + ' ' * (all_full-num_hashes)
+ 
+        percent_str = ("%.2f" % percent_done) + " %"
+        self.bar = '[ ' + self.bar + ' ] ' + percent_str
+    
+    @staticmethod
+    def getInstance():
+        return ProgressBar.instance
+        
+    def __str__(self):
+        return str(self.bar)
+
+class InvalidFileNameError(Exception):
+    def __init__(self, path):
+        self.value = 'File name \'%s\' is invalid' % path
+    def __str__(self):
+        return repr(self.value)
+
+class InvalidFileCount(Exception):
+    def __init__(self, nb_file, nb_md5):
+        self.value = '%d file(s) found, but %d MD5 found.' % (nb_file, nb_md5)
+    def __str__(self):
+        return repr(self.value)
+
+class InvalidMD5(Exception):
+    def __init__(self, path):
+        self.value = 'File \'%s\' has invalid MD5' % path
+    def __str__(self):
+        return repr(self.value)
+
+class CheckMD5:
+    def __init__(self, file_list, md5_list):
+        self.last_file = file_list.pop()
+        self.file_list = file_list
+        self.md5_list = md5_list
+        if (len(file_list) + 1) != len(md5_list):
+            raise InvalidFileCount(len(file_list) + 1, len(md5_list))
+    
+    def digest(self, filename, bytes_limit = None):
+        global READ_BLOCK_SIZE
+        md5 = hashlib.md5()
+        already_read_size = 0
+        size_file = os.path.getsize(filename)
+        with open(filename, 'rb') as f:
+            continue_read = True
+            while continue_read:
+                bytes_to_read = READ_BLOCK_SIZE
+                if bytes_limit is not None:
+                    reste_a_lire = (bytes_limit - already_read_size)
+                    if reste_a_lire < bytes_to_read:
+                        bytes_to_read = bytes_limit - already_read_size
+                        continue_to_read = False
+                data = f.read(bytes_to_read)
+                if len(data) == 0:
+                    continue_read = False
+                else:
+                    already_read_size += len(data)
+                    md5.update(data)
+        return str.upper(md5.hexdigest())
+    
+    def start(self):
+        i = 0
+        for file in self.file_list:
+            if self.digest(file) == self.md5_list[i]:
+                debug ("MD5 '" + file + "' OK (" + self.md5_list[i] + ")")
+            else:
+                raise InvalidMD5(file)
+            i+=1
+        
+        # Last file
+        if self.digest(self.last_file, (os.path.getsize(self.last_file) - (len(self.md5_list) * 32))) == self.md5_list[i]:
+            debug ("MD5 '" + self.last_file + "' OK (" + self.md5_list[i] + ")")
+        else:
+            raise InvalidMD5(self.last_file)
+
+class XTMFile:
+    
+    regex = None
+    list = None
+    md5_list = None
+    nb_files = 0
+    md5_size = 0
+    soft_name = None
+    output_name = None
+    hash_MD5 = None
+    file_size = 0
+    total_write = 0
+    
+    def __init__(self, path):
+        if XTMFile.list is None:
+            XTMFile.fetchFiles(path)
+        self.path = path
+        
+        regex = XTMFile.getFileRe()
+        matches = regex.search(path)
+        if matches is None:
+            raise InvalidFileNameError(path)
+        self.handle = open(path, 'rb')
+        groups = matches.groups()
+        self.size = os.path.getsize(path)
+        self.already_read_size = 0
+        self.bytes_to_read = self.size
+        #Cas particulier : premier fichier
+        if groups[0] == '001':
+            debug('Parsing first file', 2)
+            XTMFile.fetchHeader(self.handle)
+            self.bytes_to_read -= 104
+        #Cas particulier : dernier fichier
+        elif groups[0] == ('%03d' % XTMFile.nb_files):
+            debug('Parsing last file', 2)
+            XTMFile.md5_size = len(XTMFile.list) * 32
+            XTMFile.fetchMD5(self.handle)
+            self.bytes_to_read -= XTMFile.md5_size
+    
+    def close(self):
+        self.handle.close()
+    
+    def getPath(self):
+        return self.path
+    
+    def write(self, handle_write):
+        global READ_BLOCK_SIZE
+        continue_to_read = True
+        while continue_to_read:
+            block_size = READ_BLOCK_SIZE
+            if self.bytes_to_read - self.already_read_size < block_size:
+                block_size = self.bytes_to_read - self.already_read_size
+                continue_to_read = False
+            data = self.handle.read(block_size)
+            if len(data) == 0:
+                return False
+            handle_write.write(data)
+            self.already_read_size += len(data)
+            XTMFile.total_write += len(data)
+            instance = ProgressBar.getInstance()
+            instance.update_amount(float(XTMFile.total_write) / float(XTMFile.file_size))
+            debug(str(instance), 1, True)
+        return True
+    
+    @staticmethod
+    def getOutputName():
+        return XTMFile.output_name
+    
+    @staticmethod
+    def startMD5Check():
+        debug('Starting MD5 check.', 2)
+        t = CheckMD5(XTMFile.list, XTMFile.md5_list)
+        t.start()
+    
+    @staticmethod
+    def hasMD5():
+        return XTMFile.hash_MD5 == 1
+    
+    @staticmethod
+    def fetchHeader(handle):
+        data = handle.read(104)
+        soft_name_len = unpack_from('B', data, 0)[0]                   # taille du nom de logiciel (sur un octet ('B'))
+        XTMFile.soft_name = unicode(unpack_from('%ds' % soft_name_len, data, 1)[0])     # nom du logiciel
+                                                                       # (si la taille est 12 : '12s')
+        output_name_len = unpack_from('B', data, 40)[0]                  # taille du nom de fichier
+        XTMFile.output_name = unicode(unpack_from('%ds' % output_name_len, data, 41)[0])    # nom du fichier
+        XTMFile.hash_MD5 = unpack_from('B', data, 91)[0]                       # valeur du Hash MD5
+        XTMFile.nb_files = unpack_from('I', data, 92)[0]                       # nombre de fichiers .xtm
+        XTMFile.file_size = unpack_from('Q', data, 96)[0]                      # taille du fichier original
+
+    @staticmethod
+    def fetchMD5(handle):
+        XTMFile.md5_list = []
+        handle.seek(-XTMFile.md5_size, 2)
+        continue_while = True
+        while continue_while:
+            data = handle.read(32)
+            if (len(data) == 0):
+                continue_while = False
+            else:
+                XTMFile.md5_list.append(str(data))
+        handle.seek(0)
+        return XTMFile.md5_list
+    
+    @staticmethod
+    def getFiles(filename = None):
+        if filename is not None and XTMFile.list is None:
+            XTMFile.fetchFiles(filename)
+        return XTMFile.list
+    
+    @staticmethod
+    def getXTMFiles(filename = None):
+        xtm_files = []
+        for file in XTMFile.getFiles(filename):
+            xtm_files.append(XTMFile(file))
+        return xtm_files
+    
+    @staticmethod
+    def getFileRe(filename = None):
+        if filename is not None and XTMFile.regex is None:
+            XTMFile.fetchFileRe(filename)
+        return XTMFile.regex
+        
+    @staticmethod
+    def fetchFiles(filename):
+        regex = XTMFile.getFileRe(filename)
+        abs_path = os.path.abspath(filename)
+        abs_dir = os.path.dirname(abs_path)
+        list = []
+        for file in os.listdir(abs_dir):
+            if os.path.isfile(file) and regex.search(file) is not None:
+                list.append(file)
+        list.sort()
+        XTMFile.list = list
+        XTMFile.nb_files = len(list)
+    
+    @staticmethod
+    def fetchFileRe(filename):
+        matches = re.search('^(.*)\.\d{3}\.xtm$', filename, re.I)
+        groups = matches.groups()
+        XTMFile.regex = re.compile('^' + groups[0] + '\.(\d{3})\.xtm$', re.I)
+
+if __name__ == '__main__':
+    filename = sys.argv[1]
+    ProgressBar(0, 1, mode='fixed', char='#')
+    files = XTMFile.getXTMFiles(filename)
+    if XTMFile.hasMD5():
+        XTMFile.startMD5Check()
+    output_handle = open(XTMFile.getOutputName(), 'w+')
+    for xtmfile in files:
+        xtmfile.write(output_handle)
+        debug("File '" + xtmfile.getPath() + "' joined.")
+        xtmfile.close()
+    output_handle.close()
